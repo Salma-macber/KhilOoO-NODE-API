@@ -7,16 +7,17 @@ const path = require('path');
 
 const PORT = Number(process.env.PORT) || 3000;
 const CORS_ORIGIN = process.env.CORS_ORIGIN || '*';
-const IS_SERVERLESS =
-  Boolean(process.env.VERCEL) ||
-  Boolean(process.env.AWS_LAMBDA_FUNCTION_NAME) ||
-  Boolean(process.env.LAMBDA_TASK_ROOT) ||
-  __dirname.startsWith('/var/task');
+
+function isReadOnlyDeployRoot() {
+  return __dirname.startsWith('/var/task');
+}
 
 const RUNTIME_ROOT = path.join(os.tmpdir(), 'filters-api');
 const BUNDLED_DATA_DIR = path.join(__dirname, 'data');
-const DATA_DIR = IS_SERVERLESS ? path.join(RUNTIME_ROOT, 'data') : BUNDLED_DATA_DIR;
-const UPLOADS_DIR = IS_SERVERLESS
+const DATA_DIR = isReadOnlyDeployRoot()
+  ? path.join(RUNTIME_ROOT, 'data')
+  : BUNDLED_DATA_DIR;
+const UPLOADS_DIR = isReadOnlyDeployRoot()
   ? path.join(RUNTIME_ROOT, 'uploads')
   : path.join(__dirname, 'uploads');
 const FILTERS_FILE = path.join(DATA_DIR, 'filters.json');
@@ -31,7 +32,7 @@ async function ensureRuntimeDirs() {
       await fs.mkdir(DATA_DIR, { recursive: true });
       await fs.mkdir(UPLOADS_DIR, { recursive: true });
 
-      if (IS_SERVERLESS) {
+      if (isReadOnlyDeployRoot()) {
         try {
           await fs.access(FILTERS_FILE);
         } catch {
@@ -58,18 +59,7 @@ function getUploadFilter() {
   }
 
   uploadFilter = multer({
-    storage: IS_SERVERLESS
-      ? multer.memoryStorage()
-      : multer.diskStorage({
-          destination: (_req, _file, cb) => {
-            ensureRuntimeDirs()
-              .then(() => cb(null, UPLOADS_DIR))
-              .catch((error) => cb(error));
-          },
-          filename: (_req, file, cb) => {
-            cb(null, buildUploadFilename(file));
-          },
-        }),
+    storage: multer.memoryStorage(),
     limits: { fileSize: 20 * 1024 * 1024 },
   }).fields([
     { name: 'before_image', maxCount: 1 },
@@ -81,6 +71,7 @@ function getUploadFilter() {
 }
 
 async function persistUploadedFile(file) {
+  await ensureRuntimeDirs();
   const filename = buildUploadFilename(file);
   const filePath = path.join(UPLOADS_DIR, filename);
   await fs.writeFile(filePath, file.buffer);
@@ -153,7 +144,12 @@ async function removeUploadedFiles(files) {
 
   const entries = Object.values(files).flat();
   await Promise.all(
-    entries.map((file) => fs.unlink(file.path).catch(() => undefined)),
+    entries.map((file) => {
+      if (!file.path) {
+        return undefined;
+      }
+      return fs.unlink(file.path).catch(() => undefined);
+    }),
   );
 }
 
@@ -224,21 +220,18 @@ app.post('/api/uploadNewFilter', (req, res, next) => {
       let dngFile = req.files?.dngfile?.[0];
 
       if (!beforeImage || !afterImage || !dngFile) {
-        await removeUploadedFiles(req.files);
         return res.status(422).json({
           message: 'before_image, after_image, and dngfile are required',
         });
       }
 
-      if (IS_SERVERLESS) {
-        beforeImage = await persistUploadedFile(beforeImage);
-        afterImage = await persistUploadedFile(afterImage);
-        dngFile = await persistUploadedFile(dngFile);
-      }
+      beforeImage = await persistUploadedFile(beforeImage);
+      afterImage = await persistUploadedFile(afterImage);
+      dngFile = await persistUploadedFile(dngFile);
 
       const downloadCount = Number(req.body.download_count ?? 0);
       if (!Number.isFinite(downloadCount)) {
-        await removeUploadedFiles(req.files);
+        await removeUploadedFiles({ files: [beforeImage, afterImage, dngFile] });
         return res.status(422).json({ message: 'Invalid download_count' });
       }
 
