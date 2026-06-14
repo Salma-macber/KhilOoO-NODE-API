@@ -6,15 +6,45 @@ const path = require('path');
 
 const PORT = Number(process.env.PORT) || 3000;
 const CORS_ORIGIN = process.env.CORS_ORIGIN || '*';
+const IS_VERCEL = Boolean(process.env.VERCEL);
 
-const DATA_DIR = path.join(__dirname, 'data');
-const UPLOADS_DIR = path.join(__dirname, 'uploads');
+const BUNDLED_DATA_DIR = path.join(__dirname, 'data');
+const DATA_DIR = IS_VERCEL ? path.join('/tmp', 'filters-api', 'data') : BUNDLED_DATA_DIR;
+const UPLOADS_DIR = IS_VERCEL
+  ? path.join('/tmp', 'filters-api', 'uploads')
+  : path.join(__dirname, 'uploads');
 const FILTERS_FILE = path.join(DATA_DIR, 'filters.json');
 const DEVICES_FILE = path.join(DATA_DIR, 'devices.json');
+const BUNDLED_FILTERS_FILE = path.join(BUNDLED_DATA_DIR, 'filters.json');
+
+let dirsReady;
+
+async function ensureRuntimeDirs() {
+  if (!dirsReady) {
+    dirsReady = (async () => {
+      await fs.mkdir(DATA_DIR, { recursive: true });
+      await fs.mkdir(UPLOADS_DIR, { recursive: true });
+
+      if (IS_VERCEL) {
+        try {
+          await fs.access(FILTERS_FILE);
+        } catch {
+          await fs.copyFile(BUNDLED_FILTERS_FILE, FILTERS_FILE);
+        }
+      }
+    })();
+  }
+
+  return dirsReady;
+}
 
 const uploadFilter = multer({
   storage: multer.diskStorage({
-    destination: UPLOADS_DIR,
+    destination: (_req, _file, cb) => {
+      ensureRuntimeDirs()
+        .then(() => cb(null, UPLOADS_DIR))
+        .catch((error) => cb(error));
+    },
     filename: (_req, file, cb) => {
       const unique = `${Date.now()}-${Math.round(Math.random() * 1e9)}`;
       const ext = path.extname(file.originalname) || '.jpg';
@@ -30,6 +60,8 @@ const uploadFilter = multer({
 
 const app = express();
 
+app.set('trust proxy', 1);
+
 app.use(
   cors({
     origin: CORS_ORIGIN === '*' ? true : CORS_ORIGIN.split(',').map((s) => s.trim()),
@@ -39,6 +71,14 @@ app.use(
 );
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
+app.use(async (_req, _res, next) => {
+  try {
+    await ensureRuntimeDirs();
+    next();
+  } catch (error) {
+    next(error);
+  }
+});
 
 async function readJson(filePath, fallback) {
   try {
@@ -239,19 +279,20 @@ app.use((error, _req, res, _next) => {
   res.status(500).json({ message: 'Internal server error' });
 });
 
-async function startServer() {
-  await fs.mkdir(DATA_DIR, { recursive: true });
-  await fs.mkdir(UPLOADS_DIR, { recursive: true });
+module.exports = app;
 
-  app.listen(PORT, () => {
-    console.log(`Filters API listening on http://localhost:${PORT}/api/`);
-    console.log(
-      'Endpoints: getAllFilters, getMostDownloadFilters, updateDownloadCount/:id, uploadNewFilter, storeDevice',
-    );
-  });
+if (require.main === module) {
+  ensureRuntimeDirs()
+    .then(() => {
+      app.listen(PORT, () => {
+        console.log(`Filters API listening on http://localhost:${PORT}/api/`);
+        console.log(
+          'Endpoints: getAllFilters, getMostDownloadFilters, updateDownloadCount/:id, uploadNewFilter, storeDevice',
+        );
+      });
+    })
+    .catch((error) => {
+      console.error('[API] Failed to start server', error);
+      process.exit(1);
+    });
 }
-
-startServer().catch((error) => {
-  console.error('[API] Failed to start server', error);
-  process.exit(1);
-});
