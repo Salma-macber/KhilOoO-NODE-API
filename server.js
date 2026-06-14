@@ -2,16 +2,22 @@ const cors = require('cors');
 const express = require('express');
 const fs = require('fs/promises');
 const multer = require('multer');
+const os = require('os');
 const path = require('path');
 
 const PORT = Number(process.env.PORT) || 3000;
 const CORS_ORIGIN = process.env.CORS_ORIGIN || '*';
-const IS_VERCEL = Boolean(process.env.VERCEL);
+const IS_SERVERLESS =
+  Boolean(process.env.VERCEL) ||
+  Boolean(process.env.AWS_LAMBDA_FUNCTION_NAME) ||
+  Boolean(process.env.LAMBDA_TASK_ROOT) ||
+  __dirname.startsWith('/var/task');
 
+const RUNTIME_ROOT = path.join(os.tmpdir(), 'filters-api');
 const BUNDLED_DATA_DIR = path.join(__dirname, 'data');
-const DATA_DIR = IS_VERCEL ? path.join('/tmp', 'filters-api', 'data') : BUNDLED_DATA_DIR;
-const UPLOADS_DIR = IS_VERCEL
-  ? path.join('/tmp', 'filters-api', 'uploads')
+const DATA_DIR = IS_SERVERLESS ? path.join(RUNTIME_ROOT, 'data') : BUNDLED_DATA_DIR;
+const UPLOADS_DIR = IS_SERVERLESS
+  ? path.join(RUNTIME_ROOT, 'uploads')
   : path.join(__dirname, 'uploads');
 const FILTERS_FILE = path.join(DATA_DIR, 'filters.json');
 const DEVICES_FILE = path.join(DATA_DIR, 'devices.json');
@@ -25,7 +31,7 @@ async function ensureRuntimeDirs() {
       await fs.mkdir(DATA_DIR, { recursive: true });
       await fs.mkdir(UPLOADS_DIR, { recursive: true });
 
-      if (IS_VERCEL) {
+      if (IS_SERVERLESS) {
         try {
           await fs.access(FILTERS_FILE);
         } catch {
@@ -38,25 +44,48 @@ async function ensureRuntimeDirs() {
   return dirsReady;
 }
 
-const uploadFilter = multer({
-  storage: multer.diskStorage({
-    destination: (_req, _file, cb) => {
-      ensureRuntimeDirs()
-        .then(() => cb(null, UPLOADS_DIR))
-        .catch((error) => cb(error));
-    },
-    filename: (_req, file, cb) => {
-      const unique = `${Date.now()}-${Math.round(Math.random() * 1e9)}`;
-      const ext = path.extname(file.originalname) || '.jpg';
-      cb(null, `${file.fieldname}-${unique}${ext}`);
-    },
-  }),
-  limits: { fileSize: 20 * 1024 * 1024 },
-}).fields([
-  { name: 'before_image', maxCount: 1 },
-  { name: 'after_image', maxCount: 1 },
-  { name: 'dngfile', maxCount: 1 },
-]);
+function buildUploadFilename(file) {
+  const unique = `${Date.now()}-${Math.round(Math.random() * 1e9)}`;
+  const ext = path.extname(file.originalname) || '.jpg';
+  return `${file.fieldname}-${unique}${ext}`;
+}
+
+let uploadFilter;
+
+function getUploadFilter() {
+  if (uploadFilter) {
+    return uploadFilter;
+  }
+
+  uploadFilter = multer({
+    storage: IS_SERVERLESS
+      ? multer.memoryStorage()
+      : multer.diskStorage({
+          destination: (_req, _file, cb) => {
+            ensureRuntimeDirs()
+              .then(() => cb(null, UPLOADS_DIR))
+              .catch((error) => cb(error));
+          },
+          filename: (_req, file, cb) => {
+            cb(null, buildUploadFilename(file));
+          },
+        }),
+    limits: { fileSize: 20 * 1024 * 1024 },
+  }).fields([
+    { name: 'before_image', maxCount: 1 },
+    { name: 'after_image', maxCount: 1 },
+    { name: 'dngfile', maxCount: 1 },
+  ]);
+
+  return uploadFilter;
+}
+
+async function persistUploadedFile(file) {
+  const filename = buildUploadFilename(file);
+  const filePath = path.join(UPLOADS_DIR, filename);
+  await fs.writeFile(filePath, file.buffer);
+  return { filename, path: filePath };
+}
 
 const app = express();
 
@@ -181,7 +210,7 @@ app.post('/api/updateDownloadCount/:id', async (req, res, next) => {
 
 // POST /api/uploadNewFilter
 app.post('/api/uploadNewFilter', (req, res, next) => {
-  uploadFilter(req, res, async (error) => {
+  getUploadFilter()(req, res, async (error) => {
     if (error) {
       await removeUploadedFiles(req.files);
       return res.status(422).json({
@@ -190,15 +219,21 @@ app.post('/api/uploadNewFilter', (req, res, next) => {
     }
 
     try {
-      const beforeImage = req.files?.before_image?.[0];
-      const afterImage = req.files?.after_image?.[0];
-      const dngFile = req.files?.dngfile?.[0];
+      let beforeImage = req.files?.before_image?.[0];
+      let afterImage = req.files?.after_image?.[0];
+      let dngFile = req.files?.dngfile?.[0];
 
       if (!beforeImage || !afterImage || !dngFile) {
         await removeUploadedFiles(req.files);
         return res.status(422).json({
           message: 'before_image, after_image, and dngfile are required',
         });
+      }
+
+      if (IS_SERVERLESS) {
+        beforeImage = await persistUploadedFile(beforeImage);
+        afterImage = await persistUploadedFile(afterImage);
+        dngFile = await persistUploadedFile(dngFile);
       }
 
       const downloadCount = Number(req.body.download_count ?? 0);
@@ -266,6 +301,10 @@ app.post('/api/storeDevice', async (req, res, next) => {
 
 app.get('/api/health', (_req, res) => {
   res.json({ status: 'ok' });
+});
+
+app.get('/favicon.ico', (_req, res) => {
+  res.status(204).end();
 });
 
 app.use('/uploads', express.static(UPLOADS_DIR));
