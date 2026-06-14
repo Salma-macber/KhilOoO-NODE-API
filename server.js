@@ -153,6 +153,39 @@ async function removeUploadedFiles(files) {
   );
 }
 
+function localUploadFilename(url) {
+  if (typeof url !== 'string') {
+    return null;
+  }
+
+  const marker = '/uploads/';
+  const index = url.indexOf(marker);
+  if (index === -1) {
+    return null;
+  }
+
+  return path.basename(url.slice(index + marker.length));
+}
+
+async function deleteLocalUploadFiles(filters) {
+  const filenames = new Set();
+
+  for (const filter of filters) {
+    for (const key of ['before_image', 'after_image', 'dngfile']) {
+      const filename = localUploadFilename(filter[key]);
+      if (filename) {
+        filenames.add(filename);
+      }
+    }
+  }
+
+  await Promise.all(
+    [...filenames].map((filename) =>
+      fs.unlink(path.join(UPLOADS_DIR, filename)).catch(() => undefined),
+    ),
+  );
+}
+
 // GET /api/getAllFilters
 app.get('/api/getAllFilters', async (_req, res, next) => {
   try {
@@ -258,6 +291,24 @@ app.post('/api/uploadNewFilter', (req, res, next) => {
   });
 });
 
+// POST /api/removeAllFilters
+app.post('/api/removeAllFilters', async (_req, res, next) => {
+  try {
+    const filters = await loadFilters();
+    const removedCount = filters.length;
+
+    await deleteLocalUploadFiles(filters);
+    await saveFilters([]);
+
+    res.json({
+      message: 'All filters removed',
+      removed_count: removedCount,
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
 // POST /api/storeDevice
 app.post('/api/storeDevice', async (req, res, next) => {
   try {
@@ -319,7 +370,7 @@ if (require.main === module) {
       app.listen(PORT, () => {
         console.log(`Filters API listening on http://localhost:${PORT}/api/`);
         console.log(
-          'Endpoints: getAllFilters, getMostDownloadFilters, updateDownloadCount/:id, uploadNewFilter, storeDevice',
+          'Endpoints: getAllFilters, getMostDownloadFilters, updateDownloadCount/:id, uploadNewFilter, removeAllFilters, storeDevice',
         );
       });
     })
