@@ -291,6 +291,35 @@ app.post('/api/uploadNewFilter', (req, res, next) => {
   });
 });
 
+// POST /api/deleteFilter/:id  (Laravel-style _method=delete from Flutter)
+app.post('/api/deleteFilter/:id', async (req, res, next) => {
+  try {
+    const filterId = Number(req.params.id);
+
+    if (!Number.isFinite(filterId)) {
+      return res.status(422).json({ message: 'Invalid filter id' });
+    }
+
+    const filters = await loadFilters();
+    const index = filters.findIndex((item) => item.id === filterId);
+
+    if (index === -1) {
+      return res.status(404).json({ message: 'Filter not found' });
+    }
+
+    const [removed] = filters.splice(index, 1);
+    await deleteLocalUploadFiles([removed]);
+    await saveFilters(filters);
+
+    res.json({
+      message: 'Filter deleted successfully',
+      data: removed,
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
 // POST /api/removeAllFilters
 app.post('/api/removeAllFilters', async (_req, res, next) => {
   try {
@@ -370,7 +399,7 @@ if (require.main === module) {
       app.listen(PORT, () => {
         console.log(`Filters API listening on http://localhost:${PORT}/api/`);
         console.log(
-          'Endpoints: getAllFilters, getMostDownloadFilters, updateDownloadCount/:id, uploadNewFilter, removeAllFilters, storeDevice',
+          'Endpoints: getAllFilters, getMostDownloadFilters, updateDownloadCount/:id, uploadNewFilter, deleteFilter/:id, removeAllFilters, storeDevice',
         );
       });
     })
